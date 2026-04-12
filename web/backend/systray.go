@@ -1,9 +1,8 @@
-//go:build (!darwin && !freebsd) || cgo
+//go:build !android && ((!darwin && !freebsd) || cgo)
 
 package main
 
 import (
-	_ "embed"
 	"fmt"
 
 	"fyne.io/systray"
@@ -92,9 +91,4 @@ func onReady() {
 // onExit is called when the system tray is exiting
 func onExit() {
 	logger.Info(T(Exiting))
-}
-
-// getIcon returns the system tray icon
-func getIcon() []byte {
-	return iconData
 }
