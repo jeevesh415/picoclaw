@@ -1,25 +1,35 @@
 import { useTranslation } from "react-i18next"
 
 import type { ChannelConfig } from "@/api/channels"
+import {
+  type ArrayFieldFlusher,
+  ChannelArrayListField,
+} from "@/components/channels/channel-array-list-field"
+import {
+  asStringArray,
+  parseAllowFromInput,
+} from "@/components/channels/channel-array-utils"
 import { getSecretInputPlaceholder } from "@/components/channels/channel-config-fields"
 import { Field, KeyInput, SwitchCardField } from "@/components/shared-form"
 import { Card, CardContent } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
+
+import { StreamingConfigField } from "./streaming-config-field"
 
 interface TelegramFormProps {
   config: ChannelConfig
   onChange: (key: string, value: unknown) => void
   configuredSecrets: string[]
   fieldErrors?: Record<string, string>
+  registerArrayFieldFlusher?: (
+    fieldPath: string,
+    flusher: ArrayFieldFlusher | null,
+  ) => void
+  arrayFieldResetVersion?: number
 }
 
 function asString(value: unknown): string {
   return typeof value === "string" ? value : ""
-}
-
-function asStringArray(value: unknown): string[] {
-  if (!Array.isArray(value)) return []
-  return value.filter((item): item is string => typeof item === "string")
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -38,6 +48,8 @@ export function TelegramForm({
   onChange,
   configuredSecrets,
   fieldErrors = {},
+  registerArrayFieldFlusher,
+  arrayFieldResetVersion,
 }: TelegramFormProps) {
   const { t } = useTranslation()
   const typingConfig = asRecord(config.typing)
@@ -91,24 +103,17 @@ export function TelegramForm({
               placeholder="http://127.0.0.1:7890"
             />
           </Field>
-          <Field
+          <ChannelArrayListField
             label={t("channels.field.allowFrom")}
             hint={t("channels.form.desc.allowFrom")}
-          >
-            <Input
-              value={asStringArray(config.allow_from).join(", ")}
-              onChange={(e) =>
-                onChange(
-                  "allow_from",
-                  e.target.value
-                    .split(",")
-                    .map((s: string) => s.trim())
-                    .filter(Boolean),
-                )
-              }
-              placeholder={t("channels.field.allowFromPlaceholder")}
-            />
-          </Field>
+            value={asStringArray(config.allow_from)}
+            onChange={(value) => onChange("allow_from", value)}
+            placeholder={t("channels.field.allowFromPlaceholder")}
+            parser={parseAllowFromInput}
+            fieldPath="allow_from"
+            registerFlusher={registerArrayFieldFlusher}
+            resetVersion={arrayFieldResetVersion}
+          />
 
           <div>
             <SwitchCardField
@@ -119,6 +124,13 @@ export function TelegramForm({
                 onChange("typing", { ...typingConfig, enabled: checked })
               }
               ariaLabel={t("channels.field.typingEnabled")}
+            />
+          </div>
+
+          <div>
+            <StreamingConfigField
+              value={config.streaming}
+              onChange={(value) => onChange("streaming", value)}
             />
           </div>
 

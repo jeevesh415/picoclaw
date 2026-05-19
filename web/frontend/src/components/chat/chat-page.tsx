@@ -1,4 +1,5 @@
 import { IconPlus } from "@tabler/icons-react"
+import { useAtom } from "jotai"
 import { type ChangeEvent, useEffect, useRef, useState } from "react"
 import { useTranslation } from "react-i18next"
 import { toast } from "sonner"
@@ -15,12 +16,24 @@ import { TypingIndicator } from "@/components/chat/typing-indicator"
 import { UserMessage } from "@/components/chat/user-message"
 import { PageHeader } from "@/components/page-header"
 import { Button } from "@/components/ui/button"
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
 import { useChatModels } from "@/hooks/use-chat-models"
 import { useGateway } from "@/hooks/use-gateway"
 import { usePicoChat } from "@/hooks/use-pico-chat"
 import { useSessionHistory } from "@/hooks/use-session-history"
+import type { AssistantDetailVisibility } from "@/store/chat"
 import type { ConnectionState } from "@/store/chat"
 import type { ChatAttachment } from "@/store/chat"
+import {
+  assistantDetailVisibilityAtom,
+  shouldShowAssistantMessage,
+} from "@/store/chat"
 import type { GatewayState } from "@/store/gateway"
 
 const MAX_IMAGE_SIZE_BYTES = 7 * 1024 * 1024
@@ -109,12 +122,29 @@ export function ChatPage() {
   const [hasScrolled, setHasScrolled] = useState(false)
   const [input, setInput] = useState("")
   const [attachments, setAttachments] = useState<ChatAttachment[]>([])
+  const [assistantDetailVisibility, setAssistantDetailVisibility] = useAtom(
+    assistantDetailVisibilityAtom,
+  )
+
+  const assistantDetailVisibilityOptions: Array<{
+    value: AssistantDetailVisibility
+    label: string
+  }> = [
+    { value: "none", label: t("chat.assistantDetailVisibility.none") },
+    { value: "thought", label: t("chat.assistantDetailVisibility.thought") },
+    {
+      value: "tool_calls",
+      label: t("chat.assistantDetailVisibility.toolCalls"),
+    },
+    { value: "all", label: t("chat.assistantDetailVisibility.all") },
+  ]
 
   const {
     messages,
     connectionState,
     isTyping,
     activeSessionId,
+    contextUsage,
     sendMessage,
     switchSession,
     newChat,
@@ -153,7 +183,7 @@ export function ChatPage() {
   })
 
   const syncScrollState = (element: HTMLDivElement) => {
-    const { scrollTop, scrollHeight, clientHeight } = element
+    const { clientHeight, scrollHeight, scrollTop } = element
     setHasScrolled(scrollTop > 0)
     setIsAtBottom(scrollHeight - scrollTop <= clientHeight + 10)
   }
@@ -264,6 +294,33 @@ export function ChatPage() {
           )
         }
       >
+        <div className="border-border/60 hidden items-center gap-2 rounded-lg border px-3 py-1.5 sm:flex">
+          <span className="text-muted-foreground text-sm">
+            {t("chat.showAssistantDetails")}
+          </span>
+          <Select
+            value={assistantDetailVisibility}
+            onValueChange={(value) =>
+              setAssistantDetailVisibility(value as AssistantDetailVisibility)
+            }
+          >
+            <SelectTrigger
+              size="sm"
+              aria-label={t("chat.showAssistantDetails")}
+              className="text-muted-foreground hover:text-foreground focus-visible:border-input h-8 min-w-[104px] bg-transparent shadow-none focus-visible:ring-0"
+            >
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent align="end">
+              {assistantDetailVisibilityOptions.map((option) => (
+                <SelectItem key={option.value} value={option.value}>
+                  {option.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+
         <Button
           variant="secondary"
           size="sm"
@@ -294,7 +351,7 @@ export function ChatPage() {
       <div
         ref={scrollRef}
         onScroll={handleScroll}
-        className="min-h-0 flex-1 overflow-y-auto px-4 py-6 md:px-8 lg:px-24 xl:px-48"
+        className="min-h-0 flex-1 overflow-y-auto px-4 py-6 [scrollbar-gutter:stable] md:px-8 lg:px-24 xl:px-48"
       >
         <div className="mx-auto flex w-full max-w-250 flex-col gap-8 pb-8">
           {messages.length === 0 && !isTyping && (
@@ -305,22 +362,32 @@ export function ChatPage() {
             />
           )}
 
-          {messages.map((msg) => (
-            <div key={msg.id} className="flex w-full">
-              {msg.role === "assistant" ? (
-                <AssistantMessage
-                  content={msg.content}
-                  isThought={msg.kind === "thought"}
-                  timestamp={msg.timestamp}
-                />
-              ) : (
-                <UserMessage
-                  content={msg.content}
-                  attachments={msg.attachments}
-                />
-              )}
-            </div>
-          ))}
+          {messages.map((msg) => {
+            if (
+              !shouldShowAssistantMessage(assistantDetailVisibility, msg.kind)
+            ) {
+              return null
+            }
+
+            return (
+              <div key={msg.id} className="flex w-full">
+                {msg.role === "assistant" ? (
+                  <AssistantMessage
+                    content={msg.content}
+                    attachments={msg.attachments}
+                    kind={msg.kind}
+                    toolCalls={msg.toolCalls}
+                    timestamp={msg.timestamp}
+                  />
+                ) : (
+                  <UserMessage
+                    content={msg.content}
+                    attachments={msg.attachments}
+                  />
+                )}
+              </div>
+            )
+          })}
 
           {isTyping && <TypingIndicator />}
         </div>
@@ -341,8 +408,14 @@ export function ChatPage() {
         onAddImages={handleAddImages}
         onRemoveAttachment={handleRemoveAttachment}
         onSend={handleSend}
+        onContextDetail={() => {
+          if (sendMessage({ content: "/context", attachments: [] })) {
+            setInput("")
+          }
+        }}
         inputDisabledReason={inputDisabledReason}
         canSend={canSubmit}
+        contextUsage={contextUsage}
       />
     </div>
   )

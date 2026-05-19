@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"net/http"
+	"reflect"
 
 	"github.com/sipeed/picoclaw/pkg/config"
 )
@@ -30,6 +31,7 @@ var channelCatalog = []channelCatalogItem{
 	{Name: "maixcam", ConfigKey: "maixcam"},
 	{Name: "matrix", ConfigKey: "matrix"},
 	{Name: "irc", ConfigKey: "irc"},
+	{Name: "mqtt", ConfigKey: "mqtt"},
 }
 
 type channelConfigResponse struct {
@@ -106,6 +108,7 @@ var channelSecretFieldMap = map[string][]string{
 	"whatsapp":        {},
 	"whatsapp_native": {},
 	"maixcam":         {},
+	"mqtt":            {"username", "password"},
 }
 
 func buildChannelConfigResponse(cfg *config.Config, item channelCatalogItem) channelConfigResponse {
@@ -117,8 +120,11 @@ func buildChannelConfigResponse(cfg *config.Config, item channelCatalogItem) cha
 
 	bc := cfg.Channels.Get(item.ConfigKey)
 	if bc == nil {
-		resp.Config = map[string]any{}
-		return resp
+		bc = defaultChannelConfig(item.ConfigKey)
+		if bc == nil {
+			resp.Config = map[string]any{}
+			return resp
+		}
 	}
 
 	// Detect configured secrets by checking the raw Settings JSON
@@ -126,19 +132,81 @@ func buildChannelConfigResponse(cfg *config.Config, item channelCatalogItem) cha
 	resp.ConfiguredSecrets = secrets
 
 	// Parse settings into a generic map for JSON response
-	var settings map[string]any
-	if err := json.Unmarshal(bc.Settings, &settings); err != nil {
-		resp.Config = map[string]any{}
-		return resp
+	settings := map[string]any{}
+	if len(bc.Settings) > 0 {
+		if err := json.Unmarshal(bc.Settings, &settings); err != nil {
+			resp.Config = map[string]any{}
+			return resp
+		}
 	}
 
 	// Remove secure fields from response
 	for _, key := range secrets {
 		delete(settings, key)
 	}
+	addChannelCommonConfig(settings, bc)
 	resp.Config = settings
 
 	return resp
+}
+
+func defaultChannelConfig(configKey string) *config.Channel {
+	return config.DefaultConfig().Channels.Get(configKey)
+}
+
+func addChannelCommonConfig(settings map[string]any, bc *config.Channel) {
+	settings["enabled"] = bc.Enabled
+	if len(bc.AllowFrom) > 0 {
+		settings["allow_from"] = []string(bc.AllowFrom)
+	}
+	if bc.ReasoningChannelID != "" {
+		settings["reasoning_channel_id"] = bc.ReasoningChannelID
+	}
+	if bc.GroupTrigger.MentionOnly || len(bc.GroupTrigger.Prefixes) > 0 {
+		settings["group_trigger"] = bc.GroupTrigger
+	}
+	if bc.Typing.Enabled {
+		settings["typing"] = bc.Typing
+	}
+	if bc.Placeholder.Enabled || len(bc.Placeholder.Text) > 0 {
+		settings["placeholder"] = bc.Placeholder
+	}
+	if _, exists := settings["streaming"]; !exists {
+		if streaming, ok := channelStreamingConfig(bc); ok {
+			if !streaming.IsZero() {
+				settings["streaming"] = streaming
+			}
+		}
+	}
+}
+
+func channelStreamingConfig(bc *config.Channel) (config.StreamingConfig, bool) {
+	if bc == nil {
+		return config.StreamingConfig{}, false
+	}
+
+	decoded, err := bc.GetDecoded()
+	if err != nil || decoded == nil {
+		return config.StreamingConfig{}, false
+	}
+
+	value := reflect.ValueOf(decoded)
+	if value.Kind() == reflect.Pointer {
+		if value.IsNil() {
+			return config.StreamingConfig{}, false
+		}
+		value = value.Elem()
+	}
+	if value.Kind() != reflect.Struct {
+		return config.StreamingConfig{}, false
+	}
+
+	field := value.FieldByName("Streaming")
+	if !field.IsValid() || !field.CanInterface() {
+		return config.StreamingConfig{}, false
+	}
+	streaming, ok := field.Interface().(config.StreamingConfig)
+	return streaming, ok
 }
 
 func detectConfiguredSecrets(settings config.RawNode, channelName string) []string {

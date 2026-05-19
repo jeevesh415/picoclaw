@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mymmrac/telego"
 	ta "github.com/mymmrac/telego/telegoapi"
@@ -98,8 +99,12 @@ func (s *multipartRecordingConstructor) MultipartRequest(
 
 // successResponse returns a ta.Response that telego will treat as a successful SendMessage.
 func successResponse(t *testing.T) *ta.Response {
+	return successResponseWithMessageID(t, 1)
+}
+
+func successResponseWithMessageID(t *testing.T, messageID int) *ta.Response {
 	t.Helper()
-	msg := &telego.Message{MessageID: 1}
+	msg := &telego.Message{MessageID: messageID}
 	b, err := json.Marshal(msg)
 	require.NoError(t, err)
 	return &ta.Response{Ok: true, Result: b}
@@ -142,6 +147,7 @@ func newTestChannelWithConstructor(
 		chatIDs:     make(map[string]int64),
 		bc:          &config.Channel{Type: config.ChannelTelegram, Enabled: true},
 		tgCfg:       &config.TelegramSettings{},
+		progress:    channels.NewToolFeedbackAnimator(nil),
 	}
 }
 
@@ -264,6 +270,176 @@ func TestSend_ShortMessage_SingleCall(t *testing.T) {
 
 	assert.NoError(t, err)
 	assert.Len(t, caller.calls, 1, "short message should result in exactly one SendMessage call")
+}
+
+func TestSend_NonToolFeedbackDeletesTrackedProgressMessage(t *testing.T) {
+	caller := &stubCaller{
+		callFn: func(ctx context.Context, url string, data *ta.RequestData) (*ta.Response, error) {
+			switch {
+			case strings.Contains(url, "editMessageText"):
+				return successResponseWithMessageID(t, 1), nil
+			default:
+				t.Fatalf("unexpected API call: %s", url)
+				return nil, nil
+			}
+		},
+	}
+	ch := newTestChannel(t, caller)
+	ch.RecordToolFeedbackMessage("12345", "1", "🔧 `read_file`")
+
+	ids, err := ch.Send(context.Background(), bus.OutboundMessage{
+		ChatID:  "12345",
+		Content: "final reply",
+	})
+
+	assert.NoError(t, err)
+	assert.Equal(t, []string{"1"}, ids)
+	require.Len(t, caller.calls, 1)
+	assert.Contains(t, caller.calls[0].URL, "editMessageText")
+	_, ok := ch.currentToolFeedbackMessage("12345")
+	assert.False(t, ok, "tracked tool feedback should be cleared after final reply")
+}
+
+func TestSend_ToolFeedbackTrackingIsTopicScoped(t *testing.T) {
+	nextMessageID := 0
+	caller := &stubCaller{
+		callFn: func(ctx context.Context, url string, data *ta.RequestData) (*ta.Response, error) {
+			nextMessageID++
+			return successResponseWithMessageID(t, nextMessageID), nil
+		},
+	}
+	ch := newTestChannel(t, caller)
+
+	_, err := ch.Send(context.Background(), bus.OutboundMessage{
+		ChatID:  "-1001234567890",
+		Content: "🔧 `read_file`",
+		Context: bus.InboundContext{
+			Channel: "telegram",
+			ChatID:  "-1001234567890",
+			TopicID: "42",
+			Raw: map[string]string{
+				"message_kind": "tool_feedback",
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	_, ok := ch.currentToolFeedbackMessage("-1001234567890")
+	assert.False(t, ok, "base chat should not track topic-specific tool feedback")
+
+	msgID, ok := ch.currentToolFeedbackMessage("-1001234567890/42")
+	require.True(t, ok, "topic chat should track tool feedback")
+	assert.Equal(t, "1", msgID)
+}
+
+func TestSend_TopicReplyDoesNotFinalizeDifferentTopicToolFeedback(t *testing.T) {
+	nextMessageID := 0
+	caller := &stubCaller{
+		callFn: func(ctx context.Context, url string, data *ta.RequestData) (*ta.Response, error) {
+			nextMessageID++
+			return successResponseWithMessageID(t, nextMessageID), nil
+		},
+	}
+	ch := newTestChannel(t, caller)
+
+	_, err := ch.Send(context.Background(), bus.OutboundMessage{
+		ChatID:  "-1001234567890",
+		Content: "🔧 `read_file`",
+		Context: bus.InboundContext{
+			Channel: "telegram",
+			ChatID:  "-1001234567890",
+			TopicID: "42",
+			Raw: map[string]string{
+				"message_kind": "tool_feedback",
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	ids, err := ch.Send(context.Background(), bus.OutboundMessage{
+		ChatID:  "-1001234567890",
+		Content: "final reply in another topic",
+		Context: bus.InboundContext{
+			Channel: "telegram",
+			ChatID:  "-1001234567890",
+			TopicID: "43",
+		},
+	})
+	require.NoError(t, err)
+	require.Len(t, caller.calls, 2)
+	assert.Equal(t, []string{"2"}, ids)
+	assert.Contains(t, caller.calls[1].URL, "sendMessage")
+	assert.NotContains(t, caller.calls[1].URL, "editMessageText")
+
+	_, ok := ch.currentToolFeedbackMessage("-1001234567890/42")
+	assert.True(t, ok, "tool feedback in the original topic should remain tracked")
+}
+
+func TestFinalizeTrackedToolFeedbackMessage_StopsTrackingBeforeEdit(t *testing.T) {
+	ch := newTestChannel(t, &stubCaller{
+		callFn: func(context.Context, string, *ta.RequestData) (*ta.Response, error) {
+			t.Fatal("unexpected API call")
+			return nil, nil
+		},
+	})
+	ch.RecordToolFeedbackMessage("12345", "1", "🔧 `read_file`")
+
+	msgIDs, handled := ch.finalizeTrackedToolFeedbackMessage(
+		context.Background(),
+		"12345",
+		"final reply",
+		func(_ context.Context, chatID, messageID, content string) error {
+			_, ok := ch.currentToolFeedbackMessage(chatID)
+			assert.False(t, ok, "tracked tool feedback should be stopped before edit")
+			assert.Equal(t, "12345", chatID)
+			assert.Equal(t, "1", messageID)
+			assert.Equal(t, "final reply", content)
+			return nil
+		},
+	)
+
+	assert.True(t, handled)
+	assert.Equal(t, []string{"1"}, msgIDs)
+}
+
+func TestSend_ToolFeedbackStaysSingleMessageAfterHTMLExpansion(t *testing.T) {
+	caller := &stubCaller{
+		callFn: func(ctx context.Context, url string, data *ta.RequestData) (*ta.Response, error) {
+			return successResponse(t), nil
+		},
+	}
+	ch := newTestChannel(t, caller)
+
+	_, err := ch.Send(context.Background(), bus.OutboundMessage{
+		ChatID:  "12345",
+		Content: "🔧 `read_file`\n" + strings.Repeat("<", 2000),
+		Context: bus.InboundContext{
+			Channel: "telegram",
+			ChatID:  "12345",
+			Raw: map[string]string{
+				"message_kind": "tool_feedback",
+			},
+		},
+	})
+
+	assert.NoError(t, err)
+	assert.Len(t, caller.calls, 1, "tool feedback should stay a single Telegram message after HTML escaping")
+}
+
+func TestFitToolFeedbackForTelegram_ReservesAnimationFrame(t *testing.T) {
+	content := "🔧 `read_file`\n" + strings.Repeat("a", 4096)
+
+	fitted := fitToolFeedbackForTelegram(content, false, 4096)
+	animated := strings.Replace(
+		fitted,
+		"`\n",
+		strings.Repeat(".", channels.MaxToolFeedbackAnimationFrameLength())+"`\n",
+		1,
+	)
+
+	if got := len([]rune(parseContent(animated, false))); got > 4096 {
+		t.Fatalf("animated parsed length = %d, want <= 4096", got)
+	}
 }
 
 func TestSend_LongMessage_SingleCall(t *testing.T) {
@@ -558,6 +734,172 @@ func TestSend_UsesContextTopicIDWhenChatIDDoesNotIncludeThread(t *testing.T) {
 	assert.Equal(t, int64(-1001234567890), params.ChatID)
 	assert.Equal(t, 42, params.MessageThreadID)
 	assert.Equal(t, "Hello from topic context", params.Text)
+}
+
+func TestBeginStream_UpdateUsesForumThreadID(t *testing.T) {
+	caller := &stubCaller{
+		callFn: func(ctx context.Context, url string, data *ta.RequestData) (*ta.Response, error) {
+			return &ta.Response{Ok: true, Result: []byte("true")}, nil
+		},
+	}
+	ch := newTestChannel(t, caller)
+	ch.tgCfg.Streaming.Enabled = true
+
+	streamer, err := ch.BeginStream(context.Background(), "-1001234567890/42")
+	require.NoError(t, err)
+	require.NoError(t, streamer.Update(context.Background(), "partial"))
+	require.Len(t, caller.calls, 1)
+	assert.Contains(t, caller.calls[0].URL, "sendMessageDraft")
+
+	var params struct {
+		ChatID          int64  `json:"chat_id"`
+		MessageThreadID int    `json:"message_thread_id"`
+		Text            string `json:"text"`
+	}
+	require.NoError(t, json.Unmarshal(caller.calls[0].Data.BodyRaw, &params))
+	assert.Equal(t, int64(-1001234567890), params.ChatID)
+	assert.Equal(t, 42, params.MessageThreadID)
+	assert.Equal(t, "partial", params.Text)
+}
+
+func TestBeginStream_UsesDefaultThrottleWhenOnlyEnabled(t *testing.T) {
+	caller := &stubCaller{
+		callFn: func(ctx context.Context, url string, data *ta.RequestData) (*ta.Response, error) {
+			return &ta.Response{Ok: true, Result: []byte("true")}, nil
+		},
+	}
+	ch := newTestChannel(t, caller)
+	ch.tgCfg.Streaming = config.StreamingConfig{Enabled: true}
+
+	streamer, err := ch.BeginStream(context.Background(), "12345")
+	require.NoError(t, err)
+	require.NoError(t, streamer.Update(context.Background(), "partial"))
+	require.NoError(t, streamer.Update(context.Background(), "partial plus one"))
+
+	require.Len(t, caller.calls, 1, "second small update should be throttled by defaults")
+}
+
+func TestBeginStream_UpdateReturnsErrorWhenDraftFails(t *testing.T) {
+	callCount := 0
+	caller := &stubCaller{
+		callFn: func(ctx context.Context, url string, data *ta.RequestData) (*ta.Response, error) {
+			callCount++
+			if callCount == 1 {
+				return nil, errors.New("draft unsupported")
+			}
+			return &ta.Response{Ok: true, Result: []byte("true")}, nil
+		},
+	}
+	ch := newTestChannel(t, caller)
+	ch.tgCfg.Streaming = config.StreamingConfig{Enabled: true}
+
+	streamer, err := ch.BeginStream(context.Background(), "12345")
+	require.NoError(t, err)
+
+	err = streamer.Update(context.Background(), "partial")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "draft unsupported")
+
+	streamer.Cancel(context.Background())
+	require.Len(t, caller.calls, 2)
+	assert.Contains(t, caller.calls[1].URL, "sendMessageDraft")
+
+	var params struct {
+		ChatID  int64  `json:"chat_id"`
+		DraftID int    `json:"draft_id"`
+		Text    string `json:"text"`
+	}
+	require.NoError(t, json.Unmarshal(caller.calls[1].Data.BodyRaw, &params))
+	assert.Equal(t, int64(12345), params.ChatID)
+	assert.NotZero(t, params.DraftID)
+	assert.Equal(t, " ", params.Text)
+}
+
+func TestBeginStream_CancelClearsExistingDraft(t *testing.T) {
+	caller := &stubCaller{
+		callFn: func(ctx context.Context, url string, data *ta.RequestData) (*ta.Response, error) {
+			return &ta.Response{Ok: true, Result: []byte("true")}, nil
+		},
+	}
+	ch := newTestChannel(t, caller)
+	ch.tgCfg.Streaming = config.StreamingConfig{Enabled: true}
+
+	streamer, err := ch.BeginStream(context.Background(), "12345")
+	require.NoError(t, err)
+	require.NoError(t, streamer.Update(context.Background(), "partial"))
+	streamer.Cancel(context.Background())
+
+	require.Len(t, caller.calls, 2)
+	assert.Contains(t, caller.calls[1].URL, "sendMessageDraft")
+
+	var params struct {
+		ChatID  int64  `json:"chat_id"`
+		DraftID int    `json:"draft_id"`
+		Text    string `json:"text"`
+	}
+	require.NoError(t, json.Unmarshal(caller.calls[1].Data.BodyRaw, &params))
+	assert.Equal(t, int64(12345), params.ChatID)
+	assert.NotZero(t, params.DraftID)
+	assert.Equal(t, " ", params.Text)
+}
+
+func TestBeginStream_FinalizeClearsExistingDraft(t *testing.T) {
+	caller := &stubCaller{
+		callFn: func(ctx context.Context, url string, data *ta.RequestData) (*ta.Response, error) {
+			if strings.Contains(url, "sendMessage") && !strings.Contains(url, "sendMessageDraft") {
+				return successResponse(t), nil
+			}
+			return &ta.Response{Ok: true, Result: []byte("true")}, nil
+		},
+	}
+	ch := newTestChannel(t, caller)
+	ch.tgCfg.Streaming = config.StreamingConfig{Enabled: true}
+
+	streamer, err := ch.BeginStream(context.Background(), "12345")
+	require.NoError(t, err)
+	require.NoError(t, streamer.Update(context.Background(), "partial"))
+	require.NoError(t, streamer.Finalize(context.Background(), "final"))
+
+	require.Len(t, caller.calls, 3)
+	assert.Contains(t, caller.calls[0].URL, "sendMessageDraft")
+	assert.Contains(t, caller.calls[1].URL, "sendMessage")
+	assert.Contains(t, caller.calls[2].URL, "sendMessageDraft")
+
+	var params struct {
+		ChatID  int64  `json:"chat_id"`
+		DraftID int    `json:"draft_id"`
+		Text    string `json:"text"`
+	}
+	require.NoError(t, json.Unmarshal(caller.calls[2].Data.BodyRaw, &params))
+	assert.Equal(t, int64(12345), params.ChatID)
+	assert.NotZero(t, params.DraftID)
+	assert.Equal(t, " ", params.Text)
+}
+
+func TestBeginStream_FinalizeUsesForumThreadID(t *testing.T) {
+	caller := &stubCaller{
+		callFn: func(ctx context.Context, url string, data *ta.RequestData) (*ta.Response, error) {
+			return successResponse(t), nil
+		},
+	}
+	ch := newTestChannel(t, caller)
+	ch.tgCfg.Streaming.Enabled = true
+
+	streamer, err := ch.BeginStream(context.Background(), "-1001234567890/42")
+	require.NoError(t, err)
+	require.NoError(t, streamer.Finalize(context.Background(), "final"))
+	require.Len(t, caller.calls, 1)
+	assert.Contains(t, caller.calls[0].URL, "sendMessage")
+
+	var params struct {
+		ChatID          int64  `json:"chat_id"`
+		MessageThreadID int    `json:"message_thread_id"`
+		Text            string `json:"text"`
+	}
+	require.NoError(t, json.Unmarshal(caller.calls[0].Data.BodyRaw, &params))
+	assert.Equal(t, int64(-1001234567890), params.ChatID)
+	assert.Equal(t, 42, params.MessageThreadID)
+	assert.Equal(t, "final", params.Text)
 }
 
 func TestHandleMessage_ForumTopic_SetsMetadata(t *testing.T) {
@@ -871,5 +1213,192 @@ func TestHandleMessage_EmptyContent_Ignored(t *testing.T) {
 	case <-messageBus.InboundChan():
 		t.Fatal("Empty message should not be published to message bus")
 	default:
+	}
+}
+
+func TestHandleMessage_MediaGroupCombinesCaptionMessages(t *testing.T) {
+	messageBus, ch := newMediaGroupTestChannel(10 * time.Millisecond)
+	base := testMediaGroupMessage("album-1")
+	first := base
+	first.MessageID = 1
+	second := base
+	second.MessageID = 2
+	second.Caption = "meal caption"
+
+	require.NoError(t, ch.handleMessage(context.Background(), &first))
+	require.NoError(t, ch.handleMessage(context.Background(), &second))
+
+	select {
+	case inbound := <-messageBus.InboundChan():
+		assert.Equal(t, "2", inbound.Context.MessageID)
+		assert.Equal(t, "meal caption", inbound.Content)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for combined media group message")
+	}
+}
+
+func TestHandleMessage_MediaGroupWaitsForStaggeredMessages(t *testing.T) {
+	messageBus, ch := newMediaGroupTestChannel(100 * time.Millisecond)
+	base := testMediaGroupMessage("album-staggered")
+	first := base
+	first.MessageID = 1
+	first.Caption = "first caption"
+	second := base
+	second.MessageID = 2
+	second.Caption = "second caption"
+
+	require.NoError(t, ch.handleMessage(context.Background(), &first))
+	time.Sleep(50 * time.Millisecond)
+	require.NoError(t, ch.handleMessage(context.Background(), &second))
+
+	select {
+	case inbound := <-messageBus.InboundChan():
+		t.Fatalf("media group flushed before idle delay reset: %#v", inbound)
+	case <-time.After(75 * time.Millisecond):
+	}
+
+	select {
+	case inbound := <-messageBus.InboundChan():
+		assert.Equal(t, "1", inbound.Context.MessageID)
+		assert.Equal(t, "first caption\nsecond caption", inbound.Content)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for staggered media group message")
+	}
+}
+
+func TestFlushMediaGroupIgnoresStaleTimerGeneration(t *testing.T) {
+	messageBus, ch := newMediaGroupTestChannel(time.Hour)
+	base := testMediaGroupMessage("album-generation")
+	first := base
+	first.MessageID = 1
+	first.Caption = "first"
+	second := base
+	second.MessageID = 2
+	second.Caption = "second"
+	key := "456:album-generation"
+
+	ch.mediaGroupMu.Lock()
+	ch.mediaGroups[key] = &telegramMediaGroup{
+		messages:   []*telego.Message{&first, &second},
+		generation: 2,
+	}
+	ch.mediaGroupMu.Unlock()
+
+	ch.flushMediaGroup(context.Background(), key, 1)
+
+	select {
+	case inbound := <-messageBus.InboundChan():
+		t.Fatalf("stale media group generation flushed unexpectedly: %#v", inbound)
+	default:
+	}
+
+	ch.mediaGroupMu.Lock()
+	_, stillPending := ch.mediaGroups[key]
+	ch.mediaGroupMu.Unlock()
+	require.True(t, stillPending, "stale flush should leave the current batch pending")
+
+	ch.flushMediaGroup(context.Background(), key, 2)
+
+	select {
+	case inbound := <-messageBus.InboundChan():
+		assert.Equal(t, "1", inbound.Context.MessageID)
+		assert.Equal(t, "first\nsecond", inbound.Content)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for current generation media group flush")
+	}
+}
+
+func TestHandleMessage_MediaGroupAfterDelayStartsNewBatch(t *testing.T) {
+	messageBus, ch := newMediaGroupTestChannel(10 * time.Millisecond)
+	base := testMediaGroupMessage("album-split")
+	first := base
+	first.MessageID = 1
+	first.Caption = "first"
+	second := base
+	second.MessageID = 2
+	second.Caption = "second"
+
+	require.NoError(t, ch.handleMessage(context.Background(), &first))
+	select {
+	case inbound := <-messageBus.InboundChan():
+		assert.Equal(t, "1", inbound.Context.MessageID)
+		assert.Equal(t, "first", inbound.Content)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for first media group batch")
+	}
+
+	require.NoError(t, ch.handleMessage(context.Background(), &second))
+	select {
+	case inbound := <-messageBus.InboundChan():
+		assert.Equal(t, "2", inbound.Context.MessageID)
+		assert.Equal(t, "second", inbound.Content)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for second media group batch")
+	}
+}
+
+func TestStopFlushesPendingMediaGroups(t *testing.T) {
+	messageBus, ch := newMediaGroupTestChannel(time.Hour)
+	base := testMediaGroupMessage("album-stop")
+	msg := base
+	msg.MessageID = 1
+	msg.Caption = "caption before stop"
+
+	require.NoError(t, ch.handleMessage(context.Background(), &msg))
+	require.NoError(t, ch.Stop(context.Background()))
+
+	select {
+	case inbound := <-messageBus.InboundChan():
+		assert.Equal(t, "1", inbound.Context.MessageID)
+		assert.Equal(t, "caption before stop", inbound.Content)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for pending media group flush on stop")
+	}
+}
+
+func TestNewTelegramChannelUsesConfiguredMediaGroupDelay(t *testing.T) {
+	ch, err := NewTelegramChannel(
+		&config.Channel{Type: config.ChannelTelegram, Enabled: true},
+		&config.TelegramSettings{
+			Token:             *config.NewSecureString(testToken),
+			MediaGroupDelayMS: 750,
+		},
+		bus.NewMessageBus(),
+	)
+	require.NoError(t, err)
+	assert.Equal(t, 750*time.Millisecond, ch.mediaGroupDelay)
+
+	ch, err = NewTelegramChannel(
+		&config.Channel{Type: config.ChannelTelegram, Enabled: true},
+		&config.TelegramSettings{Token: *config.NewSecureString(testToken)},
+		bus.NewMessageBus(),
+	)
+	require.NoError(t, err)
+	assert.Equal(t, defaultMediaGroupDelay, ch.mediaGroupDelay)
+}
+
+func newMediaGroupTestChannel(delay time.Duration) (*bus.MessageBus, *TelegramChannel) {
+	messageBus := bus.NewMessageBus()
+	ch := &TelegramChannel{
+		BaseChannel:     channels.NewBaseChannel("telegram", nil, messageBus, nil),
+		chatIDs:         make(map[string]int64),
+		ctx:             context.Background(),
+		mediaGroups:     make(map[string]*telegramMediaGroup),
+		mediaGroupDelay: delay,
+	}
+	return messageBus, ch
+}
+
+func testMediaGroupMessage(mediaGroupID string) telego.Message {
+	return telego.Message{
+		Chat: telego.Chat{
+			ID:   456,
+			Type: "private",
+		},
+		From: &telego.User{
+			ID:        789,
+			FirstName: "User",
+		},
+		MediaGroupID: mediaGroupID,
 	}
 }

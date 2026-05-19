@@ -2,6 +2,7 @@ package api
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,19 +11,21 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"reflect"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
-	"github.com/sipeed/picoclaw/pkg/channels/pico"
 	"github.com/sipeed/picoclaw/pkg/config"
 	"github.com/sipeed/picoclaw/pkg/health"
 	"github.com/sipeed/picoclaw/pkg/logger"
 	"github.com/sipeed/picoclaw/pkg/netbind"
 	ppid "github.com/sipeed/picoclaw/pkg/pid"
+	"github.com/sipeed/picoclaw/pkg/providers"
 	"github.com/sipeed/picoclaw/web/backend/utils"
 )
 
@@ -37,26 +40,10 @@ var gateway = struct {
 	startupDeadline     time.Time
 	logs                *LogBuffer
 	pidData             *ppid.PidFileData // pid file data read from picoclaw.pid.json
-	picoToken           string            // cached pico token from config (for proxy auth validation)
+	picoToken           string            // cached raw pico token for upstream gateway proxy injection
 }{
 	runtimeStatus: "stopped",
 	logs:          NewLogBuffer(200),
-}
-
-// refreshPicoToken updates gateway.picoToken from cfg
-func refreshPicoToken(cfg *config.Config) {
-	gateway.mu.Lock()
-	defer gateway.mu.Unlock()
-	var picoCfg config.PicoSettings
-	if bc := cfg.Channels.GetByType(config.ChannelPico); bc != nil {
-		decoded, err := bc.GetDecoded()
-		if err == nil && decoded != nil {
-			if p, ok := decoded.(*config.PicoSettings); ok {
-				picoCfg = *p
-			}
-		}
-	}
-	gateway.picoToken = picoCfg.Token.String()
 }
 
 // refreshPicoTokensLocked reads the pico token from config and caches it.
@@ -101,18 +88,15 @@ const (
 	tokenPrefix = "token."
 )
 
-// picoComposedToken returns "pico-"+pidToken+picoToken for gateway auth.
-func picoComposedToken(token string) string {
+// picoGatewayProtocol returns the gateway-facing pico subprotocol that the
+// launcher should inject when proxying browser traffic upstream.
+func picoGatewayProtocol() string {
 	gateway.mu.Lock()
 	defer gateway.mu.Unlock()
-	// if not initial pico token, don't allow gateway auth
-	if gateway.picoToken == "" || gateway.pidData == nil {
+	if gateway.picoToken == "" {
 		return ""
 	}
-	if tokenPrefix+gateway.picoToken != token {
-		return ""
-	}
-	return pico.PicoTokenPrefix + gateway.pidData.Token + gateway.picoToken
+	return tokenPrefix + gateway.picoToken
 }
 
 var (
@@ -184,7 +168,7 @@ func isLikelyGatewayProcess(pid int) (bool, bool) {
 			`$p=Get-CimInstance Win32_Process -Filter "ProcessId = %d"; if ($null -eq $p) { "" } else { $p.CommandLine }`,
 			pid,
 		)
-		out, err := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", psCmd).Output()
+		out, err := launcherExecCommand("powershell", "-NoProfile", "-NonInteractive", "-Command", psCmd).Output()
 		if err == nil {
 			cmdline := strings.TrimSpace(string(out))
 			if cmdline != "" {
@@ -193,7 +177,7 @@ func isLikelyGatewayProcess(pid int) (bool, bool) {
 		}
 
 		// Fallback: determine only whether the process still exists.
-		out, err = exec.Command("tasklist", "/FI", "PID eq "+strconv.Itoa(pid), "/FO", "CSV", "/NH").Output()
+		out, err = launcherExecCommand("tasklist", "/FI", "PID eq "+strconv.Itoa(pid), "/FO", "CSV", "/NH").Output()
 		if err != nil {
 			return false, false
 		}
@@ -207,7 +191,7 @@ func isLikelyGatewayProcess(pid int) (bool, bool) {
 			if strings.Contains(line, "\"picoclaw.exe\"") {
 				return true, true
 			}
-			return false, false
+			return false, true
 		}
 		if strings.Contains(line, "no tasks are running") {
 			return false, true
@@ -215,7 +199,7 @@ func isLikelyGatewayProcess(pid int) (bool, bool) {
 		return false, true
 	}
 
-	out, err := exec.Command("ps", "-o", "command=", "-p", strconv.Itoa(pid)).Output()
+	out, err := launcherExecCommand("ps", "-o", "command=", "-p", strconv.Itoa(pid)).Output()
 	if err != nil {
 		return false, false
 	}
@@ -399,6 +383,9 @@ func (h *Handler) gatewayStartReady() (bool, string, error) {
 	if modelCfg == nil {
 		return false, fmt.Sprintf("default model %q is invalid", modelName), nil
 	}
+	if !defaultModelAllowedForModelConfig(modelCfg) {
+		return false, fmt.Sprintf("default model %q is not usable for chat", modelName), nil
+	}
 
 	if !hasModelConfiguration(modelCfg) {
 		return false, fmt.Sprintf("default model %q has no credentials configured", modelName), nil
@@ -427,6 +414,10 @@ func computeConfigSignature(cfg *config.Config) string {
 	if defaultModel != "" {
 		parts = append(parts, "model:"+defaultModel)
 	}
+	modelStreamingSignatures := computeModelStreamingSignatures(cfg)
+	if len(modelStreamingSignatures) > 0 {
+		parts = append(parts, "model_streaming:"+strings.Join(modelStreamingSignatures, ","))
+	}
 	toolSignatures := []string{}
 	if cfg.Tools.ReadFile.Enabled {
 		toolSignatures = append(toolSignatures, "read_file")
@@ -451,6 +442,10 @@ func computeConfigSignature(cfg *config.Config) string {
 	}
 	if cfg.Tools.Web.Enabled {
 		toolSignatures = append(toolSignatures, "web")
+		webConfig, err := json.Marshal(canonicalizeSignatureValue(reflect.ValueOf(cfg.Tools.Web)))
+		if err == nil {
+			parts = append(parts, "webcfg:"+string(webConfig))
+		}
 	}
 	if cfg.Tools.WebFetch.Enabled {
 		toolSignatures = append(toolSignatures, "web_fetch")
@@ -494,7 +489,319 @@ func computeConfigSignature(cfg *config.Config) string {
 	if len(toolSignatures) > 0 {
 		parts = append(parts, "tools:"+strings.Join(toolSignatures, ","))
 	}
+	channelSignatures := computeChannelSignatures(cfg.Channels)
+	if len(channelSignatures) > 0 {
+		parts = append(parts, "channels:"+strings.Join(channelSignatures, ","))
+	}
 	return strings.Join(parts, ";")
+}
+
+func computeModelStreamingSignatures(cfg *config.Config) []string {
+	if cfg == nil {
+		return nil
+	}
+	defaultProvider := strings.TrimSpace(cfg.Agents.Defaults.Provider)
+	if defaultProvider == "" {
+		defaultProvider = "openai"
+	}
+	names := []string{strings.TrimSpace(cfg.Agents.Defaults.GetModelName())}
+	names = append(names, cfg.Agents.Defaults.ModelFallbacks...)
+	if cfg.Agents.Defaults.Routing != nil {
+		names = append(names, cfg.Agents.Defaults.Routing.LightModel)
+	}
+	for _, agent := range cfg.Agents.List {
+		if agent.Model == nil {
+			continue
+		}
+		names = append(names, agent.Model.Primary)
+		names = append(names, agent.Model.Fallbacks...)
+	}
+
+	seenNames := make(map[string]bool)
+	seenEntries := make(map[string]bool)
+	signatures := make([]string, 0, len(names))
+	for _, name := range names {
+		name = strings.TrimSpace(name)
+		if name == "" || seenNames[name] {
+			continue
+		}
+		seenNames[name] = true
+		for _, match := range modelConfigsMatchingSignatureRef(cfg.ModelList, name, defaultProvider) {
+			mc := match.model
+			entry := strings.Join([]string{
+				name,
+				strconv.Itoa(match.index),
+				strings.TrimSpace(mc.Provider),
+				strings.TrimSpace(mc.Model),
+				strconv.FormatBool(mc.Streaming.Enabled),
+			}, ":")
+			if seenEntries[entry] {
+				continue
+			}
+			seenEntries[entry] = true
+			signatures = append(signatures, entry)
+		}
+	}
+	sort.Strings(signatures)
+	return signatures
+}
+
+type signatureModelConfigMatch struct {
+	index int
+	model *config.ModelConfig
+}
+
+func modelConfigsMatchingSignatureRef(
+	modelList []*config.ModelConfig,
+	raw string,
+	defaultProvider string,
+) []signatureModelConfigMatch {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	matches := make([]signatureModelConfigMatch, 0, 1)
+	for i, mc := range modelList {
+		if mc == nil || strings.TrimSpace(mc.ModelName) != raw {
+			continue
+		}
+		matches = append(matches, signatureModelConfigMatch{index: i, model: mc})
+	}
+	if len(matches) > 0 {
+		return matches
+	}
+	for i, mc := range modelList {
+		if mc == nil || strings.TrimSpace(mc.Model) != raw {
+			continue
+		}
+		return []signatureModelConfigMatch{{index: i, model: mc}}
+	}
+	for i, mc := range modelList {
+		if modelConfigMatchesBareRef(mc, raw, defaultProvider) {
+			return []signatureModelConfigMatch{{index: i, model: mc}}
+		}
+	}
+
+	rawRef := providers.ParseModelRef(raw, "")
+	rawHasProvider := rawRef != nil && hasUnambiguousProviderPrefix(raw) &&
+		strings.TrimSpace(rawRef.Provider) != "" && strings.TrimSpace(rawRef.Model) != ""
+	if rawHasProvider {
+		for i, mc := range modelList {
+			if modelConfigMatchesProviderRef(mc, raw) {
+				return []signatureModelConfigMatch{{index: i, model: mc}}
+			}
+		}
+	}
+	return nil
+}
+
+func hasUnambiguousProviderPrefix(raw string) bool {
+	provider, _, found := strings.Cut(strings.TrimSpace(raw), "/")
+	if !found {
+		return false
+	}
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	if provider == "" {
+		return false
+	}
+	normalizedProvider := providers.NormalizeProvider(provider)
+	if !providers.IsSupportedModelProvider(normalizedProvider) {
+		return false
+	}
+	return true
+}
+
+func modelConfigMatchesProviderRef(mc *config.ModelConfig, raw string) bool {
+	if mc == nil {
+		return false
+	}
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return false
+	}
+	rawRef := providers.ParseModelRef(raw, "")
+	if rawRef == nil || strings.TrimSpace(rawRef.Provider) == "" || strings.TrimSpace(rawRef.Model) == "" {
+		return false
+	}
+	protocol, modelID := providers.ExtractProtocol(mc)
+	return providers.ModelKey(protocol, modelID) == providers.ModelKey(rawRef.Provider, rawRef.Model)
+}
+
+func modelConfigMatchesBareRef(mc *config.ModelConfig, raw string, defaultProvider string) bool {
+	if mc == nil {
+		return false
+	}
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return false
+	}
+	protocol, modelID := providers.ExtractProtocol(mc)
+	if strings.TrimSpace(modelID) != raw {
+		return false
+	}
+	return providers.NormalizeProvider(protocol) == providers.NormalizeProvider(defaultProvider)
+}
+
+func computeChannelSignatures(channels config.ChannelsConfig) []string {
+	if len(channels) == 0 {
+		return nil
+	}
+
+	keys := make([]string, 0, len(channels))
+	for name := range channels {
+		keys = append(keys, name)
+	}
+	sort.Strings(keys)
+
+	signatures := make([]string, 0, len(keys))
+	for _, name := range keys {
+		channel := channels[name]
+		if channel == nil {
+			signatures = append(signatures, name+":<nil>")
+			continue
+		}
+
+		payload := struct {
+			Enabled            bool                       `json:"enabled"`
+			Type               string                     `json:"type"`
+			AllowFrom          config.FlexibleStringSlice `json:"allow_from,omitempty"`
+			ReasoningChannelID string                     `json:"reasoning_channel_id,omitempty"`
+			GroupTrigger       config.GroupTriggerConfig  `json:"group_trigger,omitempty"`
+			Typing             config.TypingConfig        `json:"typing,omitempty"`
+			Placeholder        config.PlaceholderConfig   `json:"placeholder,omitempty"`
+			Settings           json.RawMessage            `json:"settings,omitempty"`
+		}{
+			Enabled:            channel.Enabled,
+			Type:               channel.Type,
+			AllowFrom:          channel.AllowFrom,
+			ReasoningChannelID: channel.ReasoningChannelID,
+			GroupTrigger:       channel.GroupTrigger,
+			Typing:             channel.Typing,
+			Placeholder:        channel.Placeholder,
+			Settings:           normalizeChannelSettings(channel),
+		}
+
+		encoded, err := json.Marshal(payload)
+		if err != nil {
+			signatures = append(signatures, name+":<invalid>")
+			continue
+		}
+		signatures = append(signatures, name+":"+string(encoded))
+	}
+
+	return signatures
+}
+
+func normalizeChannelSettings(channel *config.Channel) json.RawMessage {
+	if channel == nil {
+		return nil
+	}
+
+	decoded, err := channel.GetDecoded()
+	if err == nil && decoded != nil {
+		normalized, err := json.Marshal(canonicalizeSignatureValue(reflect.ValueOf(decoded)))
+		if err == nil {
+			return normalized
+		}
+	}
+
+	return normalizeRawJSON(channel.Settings)
+}
+
+func normalizeRawJSON(raw config.RawNode) json.RawMessage {
+	if len(raw) == 0 {
+		return nil
+	}
+
+	var value any
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return bytes.TrimSpace(raw)
+	}
+
+	normalized, err := json.Marshal(value)
+	if err != nil {
+		return bytes.TrimSpace(raw)
+	}
+	return normalized
+}
+
+func canonicalizeSignatureValue(value reflect.Value) any {
+	if !value.IsValid() {
+		return nil
+	}
+
+	if value.CanInterface() {
+		switch typed := value.Interface().(type) {
+		case config.SecureString:
+			return typed.String()
+		case *config.SecureString:
+			if typed == nil {
+				return ""
+			}
+			return typed.String()
+		case config.SecureStrings:
+			return typed.Values()
+		case *config.SecureStrings:
+			if typed == nil {
+				return nil
+			}
+			return typed.Values()
+		}
+	}
+
+	switch value.Kind() {
+	case reflect.Interface, reflect.Pointer:
+		if value.IsNil() {
+			return nil
+		}
+		return canonicalizeSignatureValue(value.Elem())
+	case reflect.Struct:
+		result := make(map[string]any)
+		valueType := value.Type()
+		for i := 0; i < value.NumField(); i++ {
+			field := valueType.Field(i)
+			if field.PkgPath != "" {
+				continue
+			}
+			tag := field.Tag.Get("json")
+			name := field.Name
+			if tag != "" {
+				if comma := strings.Index(tag, ","); comma >= 0 {
+					tag = tag[:comma]
+				}
+				if tag == "-" {
+					continue
+				}
+				if tag != "" {
+					name = tag
+				}
+			}
+			result[name] = canonicalizeSignatureValue(value.Field(i))
+		}
+		return result
+	case reflect.Slice, reflect.Array:
+		length := value.Len()
+		result := make([]any, 0, length)
+		for i := 0; i < length; i++ {
+			result = append(result, canonicalizeSignatureValue(value.Index(i)))
+		}
+		return result
+	case reflect.Map:
+		if value.Type().Key().Kind() != reflect.String {
+			return value.Interface()
+		}
+		result := make(map[string]any, value.Len())
+		iter := value.MapRange()
+		for iter.Next() {
+			result[iter.Key().String()] = canonicalizeSignatureValue(iter.Value())
+		}
+		return result
+	default:
+		if value.CanInterface() {
+			return value.Interface()
+		}
+		return nil
+	}
 }
 
 func gatewayRestartRequiredBySignature(bootSignature, currentSignature, gatewayStatus string) bool {
@@ -726,6 +1033,7 @@ func (h *Handler) startGatewayLocked(initialStatus string, existingPid int) (int
 	logger.InfoC("gateway", fmt.Sprintf("Starting gateway process (%s)", execPath))
 
 	cmd = gatewayExecCommand(execPath, h.gatewayCommandArgs()...)
+	applyLauncherProcAttrs(cmd)
 	cmd.Env = os.Environ()
 	// Forward the launcher's config path via the environment variable that
 	// GetConfigPath() already reads, so the gateway sub-process uses the same
@@ -752,7 +1060,7 @@ func (h *Handler) startGatewayLocked(initialStatus string, existingPid int) (int
 	gateway.logs.Reset()
 
 	// Ensure Pico Channel is configured before starting gateway
-	changed, err := h.EnsurePicoChannel("")
+	changed, err := h.EnsurePicoChannel()
 	if err != nil {
 		logger.ErrorC("gateway", fmt.Sprintf("Warning: failed to ensure pico channel: %v", err))
 		// Non-fatal: gateway can still start without pico channel
@@ -761,6 +1069,11 @@ func (h *Handler) startGatewayLocked(initialStatus string, existingPid int) (int
 	// Already holding gateway.mu from caller.
 	if changed {
 		refreshPicoTokensLocked(h.configPath)
+		cfg, err = config.LoadConfig(h.configPath)
+		if err != nil {
+			return 0, fmt.Errorf("failed to reload config after ensuring pico channel: %w", err)
+		}
+		defaultModelName = strings.TrimSpace(cfg.Agents.Defaults.GetModelName())
 	}
 
 	if err := cmd.Start(); err != nil {
